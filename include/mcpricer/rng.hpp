@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 
 #include "mcpricer/normal.hpp"
@@ -84,7 +85,7 @@ private:
     Philox4x32::Key key_;
     Philox4x32::Counter ctr_;
     std::array<std::uint64_t, 2> buffer_{};
-    int pos_{2};
+    std::size_t pos_{2};
 };
 
 }  // namespace mcp
