@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""Builds every figure and table of the report from the CSV files in results/.
+
+    python scripts/make_figures.py [--results results] [--report report]
+
+Outputs
+    report/figures/*.pdf      vector figures included by the LaTeX report
+    docs/img/*.png            the same figures for the README
+    report/generated/*.tex    tables and \\newcommand macros, so that every number
+                              quoted in the report comes from the experiments
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import math
+import platform
+import shutil
+import subprocess
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+from matplotlib import font_manager  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[1]
+
+# Categorical palette (fixed order, validated for colour-vision deficiencies).
+# Each series also gets its own marker so identity never relies on colour alone.
+STYLE = {
+    "crude": dict(color="#2a78d6", marker="o", label="Crude MC"),
+    "antithetic": dict(color="#eb6834", marker="s", label="Antithetic"),
+    "control_variate": dict(color="#1baf7a", marker="^", label="Control variate"),
+    "antithetic_control_variate": dict(color="#eda100", marker="D", label="Antithetic + CV"),
+    "rqmc_van_der_corput": dict(color="#e87ba4", marker="v", label="Randomised QMC"),
+}
+GREEK_STYLE = {
+    "fd_crn": dict(color="#2a78d6", marker="o", label="Finite diff., CRN"),
+    "fd_independent": dict(color="#eb6834", marker="s", label="Finite diff., independent"),
+    "pathwise": dict(color="#1baf7a", marker="^", label="Pathwise"),
+    "likelihood_ratio": dict(color="#eda100", marker="D", label="Likelihood ratio"),
+}
+METHOD_NAMES = {
+    "crude": "Crude Monte Carlo",
+    "antithetic": "Antithetic variates",
+    "control_variate": "Control variate",
+    "antithetic_control_variate": "Antithetic + control variate",
+}
+INK, INK_MUTED, GRID = "#0b0b0b", "#52514e", "#e4e3df"
+TEXT_WIDTH = 6.3  # inches, A4 with 2.5 cm margins
+
+
+# --------------------------------------------------------------------------- style
+def setup_style() -> None:
+    logging.getLogger("fontTools").setLevel(logging.ERROR)  # harmless font-metadata warnings
+    family = "serif"
+    kpse = shutil.which("kpsewhich")
+    if kpse:  # use the report's font (Latin Modern) when a TeX distribution is installed
+        try:
+            out = subprocess.run([kpse, "lmroman10-regular.otf"], capture_output=True, text=True, timeout=30)
+            path = out.stdout.strip()
+            if path and Path(path).exists():
+                font_manager.fontManager.addfont(path)
+                family = font_manager.FontProperties(fname=path).get_name()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    plt.rcParams.update({
+        "font.family": family,
+        "mathtext.fontset": "cm",
+        "font.size": 9,
+        "axes.titlesize": 9,
+        "axes.labelsize": 9,
+        "legend.fontsize": 8,
+        "xtick.labelsize": 8,
+        "ytick.labelsize": 8,
+        "axes.edgecolor": INK_MUTED,
+        "axes.labelcolor": INK,
+        "xtick.color": INK_MUTED,
+        "ytick.color": INK_MUTED,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.grid": True,
+        "grid.color": GRID,
+        "grid.linewidth": 0.6,
+        "axes.axisbelow": True,
+        "lines.linewidth": 1.4,
+        "lines.markersize": 4.5,
+        "legend.frameon": False,
+        "savefig.bbox": "tight",
+        "savefig.pad_inches": 0.02,
+        "pdf.fonttype": 42,
+    })
+
+
+def save(fig, name: str, report: Path) -> None:
+    fig.savefig(report / "figures" / f"{name}.pdf", metadata={"CreationDate": None})
+    img = ROOT / "docs" / "img"
+    img.mkdir(parents=True, exist_ok=True)
+    fig.savefig(img / f"{name}.png", dpi=200)
+    plt.close(fig)
+
+
+def loglog_slope(x, y) -> float:
+    return float(np.polyfit(np.log(np.asarray(x, float)), np.log(np.asarray(y, float)), 1)[0])
+
+
+def log2_label(n: int) -> str:
+    return f"2^{{{int(round(math.log2(n)))}}}"
+
+
+# --------------------------------------------------------------------------- formatting helpers
+def decimals_for(se: float, sig: int = 2) -> int:
+    if not (se > 0 and math.isfinite(se)):
+        return 4
+    return max(0, sig - 1 - int(math.floor(math.log10(se))))
+
+
+def pm(value: float, se: float) -> str:
+    d = decimals_for(se)
+    return f"${value:.{d}f} \\pm {se:.{d}f}$"
+
+
+def num(x: float, digits: int = 3) -> str:
+    """Significant-digit formatting for tables."""
+    if not math.isfinite(x):
+        return "--"
+    if x == 0:
+        return "0"
+    mag = int(math.floor(math.log10(abs(x))))
+    d = max(0, digits - 1 - mag)
+    return f"{x:,.{d}f}".replace(",", "\\,")
+
+
+class Macros:
+    def __init__(self) -> None:
+        self.lines: list[str] = ["% Generated by scripts/make_figures.py -- do not edit by hand."]
+
+    def add(self, name: str, value: str) -> None:
+        self.lines.append(f"\\newcommand{{\\{name}}}{{{value}}}")
+
+    def write(self, path: Path) -> None:
+        path.write_text("\n".join(self.lines) + "\n", encoding="utf-8")
+
+
+def write_table(path: Path, body: str) -> None:
+    path.write_text("% Generated by scripts/make_figures.py -- do not edit by hand.\n" + body, encoding="utf-8")
+
+
+def cpu_name() -> str:
+    try:
+        if platform.system() == "Windows":
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_Processor).Name"],
+                capture_output=True, text=True, timeout=30)
+            if out.stdout.strip():
+                return out.stdout.strip().splitlines()[0]
+        elif platform.system() == "Linux":
+            for line in Path("/proc/cpuinfo").read_text().splitlines():
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+        elif platform.system() == "Darwin":
+            out = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True)
+            if out.stdout.strip():
+                return out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return platform.processor() or "unknown CPU"
+
+
+def tex_escape(s: str) -> str:
+    return s.replace("\\", "/").replace("_", "\\_").replace("&", "\\&").replace("%", "\\%").replace("#", "\\#")
+
+
+# --------------------------------------------------------------------------- figures
+def fig_convergence(res: Path, report: Path, mac: Macros) -> None:
+    df = pd.read_csv(res / "convergence.csv")
+    reps = int(df["replications"].iloc[0])
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(TEXT_WIDTH, 3.05))
+    for method, g in df.groupby("method", sort=False):
+        st = STYLE[method]
+        fit = g[g["n_paths"] >= 1024]
+        slope = loglog_slope(fit["n_paths"], fit["rmse"])
+        mac.add(f"Slope{method.title().replace('_', '')}", f"\\ensuremath{{{slope:.3f}}}")
+        ax1.plot(g["n_paths"], g["rmse"], color=st["color"], marker=st["marker"],
+                 label=f"{st['label']} (slope ${slope:.2f}$)")
+        ax1.plot(g["n_paths"], g["mean_std_error"], color=st["color"], ls="--", lw=0.9)
+        ax2.plot(g["n_paths"], g["coverage_95"], color=st["color"], marker=st["marker"], label=st["label"])
+    ax1.set(yscale="log", xlabel="number of paths $N$", ylabel="RMSE of the price")
+    ax1.set_xscale("log", base=2)
+    ax1.text(0.03, 0.04, f"solid: empirical RMSE over {reps} runs\ndashed: mean estimated std. error",
+             transform=ax1.transAxes, fontsize=7, color=INK_MUTED, va="bottom")
+    ax1.set_title("(a) error decay", loc="left")
+
+    band = 1.96 * math.sqrt(0.95 * 0.05 / reps)
+    ax2.axhspan(0.95 - band, 0.95 + band, color="#efeeea", lw=0)
+    ax2.axhline(0.95, color=INK_MUTED, lw=0.8, ls="--")
+    ax2.set_xscale("log", base=2)
+    lo = min(0.9, float(df["coverage_95"].min()) - 0.005)
+    ax2.set(xlabel="number of paths $N$", ylabel="empirical coverage", ylim=(lo, 1.0))
+    ax2.set_title("(b) coverage of the 95% confidence interval", loc="left")
+    ax2.text(0.97, 0.04, f"shaded: binomial 95% range\nfor {reps} replications", transform=ax2.transAxes,
+             ha="right", fontsize=7, color=INK_MUTED)
+    handles, labels = ax1.get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=2, bbox_to_anchor=(0.5, -0.01))
+    fig.tight_layout(w_pad=2.0, rect=(0, 0.11, 1, 1))
+    save(fig, "convergence", report)
+
+    big = df[df["n_paths"] >= 2 ** 14]
+    mac.add("CoverageMin", f"{big['coverage_95'].min():.3f}")
+    mac.add("CoverageMax", f"{big['coverage_95'].max():.3f}")
+    small = df[(df["n_paths"] == df["n_paths"].min()) & (df["method"] == "crude")]
+    mac.add("CoverageSmallCrude", f"{float(small['coverage_95'].iloc[0]):.3f}")
+    mac.add("Replications", str(reps))
+    mac.add("MaxConvergencePaths", log2_label(int(df["n_paths"].max())))
+    mac.add("MinConvergencePaths", log2_label(int(df["n_paths"].min())))
+    ratio = (df["mean_std_error"] / df["rmse"])
+    mac.add("SeOverRmseMin", f"{ratio[df['n_paths'] >= 2 ** 10].min():.2f}")
+    mac.add("SeOverRmseMax", f"{ratio[df['n_paths'] >= 2 ** 10].max():.2f}")
+
+
+def fig_running(res: Path, report: Path, bs: float) -> None:
+    df = pd.read_csv(res / "running_estimate.csv")
+    fig, ax = plt.subplots(figsize=(TEXT_WIDTH, 2.6))
+    for method in ["crude", "antithetic_control_variate"]:
+        g = df[(df["method"] == method) & (df["n_paths"] >= 64)]
+        st = STYLE[method]
+        ax.fill_between(g["n_paths"], g["ci_lower"], g["ci_upper"], color=st["color"], alpha=0.18, lw=0)
+        ax.plot(g["n_paths"], g["price"], color=st["color"], label=f"{st['label']}: estimate and 95% CI")
+    ax.axhline(bs, color=INK, lw=0.9, ls="--", label=f"Black-Scholes {bs:.4f}")
+    ax.set_xscale("log", base=2)
+    ax.set(xlabel="number of paths $N$", ylabel="price estimate", ylim=(bs - 2.0, bs + 2.0))
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    save(fig, "running_estimate", report)
+
+
+def fig_variance_reduction(res: Path, report: Path) -> None:
+    df = pd.read_csv(res / "variance_reduction.csv")
+    fig, axes = plt.subplots(1, 2, figsize=(TEXT_WIDTH, 2.7), sharey=True)
+    for ax, opt in zip(axes, ["call", "put"]):
+        d = df[df["type"] == opt]
+        for method in ["antithetic", "control_variate", "antithetic_control_variate"]:
+            g = d[d["method"] == method]
+            st = STYLE[method]
+            ax.plot(g["strike"], g["vrf"], color=st["color"], marker=st["marker"], label=st["label"])
+        ax.axvline(100.0, color=INK_MUTED, lw=0.7, ls=":")
+        ax.axhline(1.0, color=INK_MUTED, lw=0.7)
+        ax.set_yscale("log")
+        ax.set_xlabel("strike $K$  ($S_0 = 100$)")
+        ax.set_title(f"({'a' if opt == 'call' else 'b'}) European {opt}", loc="left")
+    axes[0].set_ylabel("variance reduction factor")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=3, bbox_to_anchor=(0.5, -0.01))
+    fig.tight_layout(w_pad=1.5, rect=(0, 0.08, 1, 1))
+    save(fig, "variance_reduction", report)
+
+
+def fig_greeks_bump(res: Path, report: Path, mac: Macros) -> None:
+    df = pd.read_csv(res / "greeks_bump.csv")
+    n_paths = int(df["n_paths"].iloc[0])
+    fig, axes = plt.subplots(1, 2, figsize=(TEXT_WIDTH, 3.15))
+    # Variance slopes predicted by the theory (Section 5), drawn just above the small-h end of each curve.
+    guides = {
+        "delta": [("fd_independent", -1.0, r"$\propto h^{-1}$")],
+        "gamma": [("fd_independent", -2.0, r"$\propto h^{-2}$"), ("fd_crn", -0.5, r"$\propto h^{-1/2}$")],
+    }
+    for ax, greek, tag in zip(axes, ["delta", "gamma"], ["a", "b"]):
+        d = df[df["greek"] == greek]
+        for method in ["fd_crn", "fd_independent"]:
+            g = d[d["method"] == method]
+            st = GREEK_STYLE[method]
+            ax.plot(g["h_rel"], g["rmse"], color=st["color"], marker=st["marker"], label=st["label"])
+        for method in ["pathwise", "likelihood_ratio"]:
+            g = d[d["method"] == method]
+            if len(g):
+                st = GREEK_STYLE[method]
+                ax.axhline(float(g["rmse"].iloc[0]), color=st["color"], lw=1.2, ls="--",
+                           label=f"{st['label']} (no bump)")
+        for method, p, text in guides[greek]:
+            g = d[d["method"] == method].sort_values("h_rel")
+            h0, y0 = float(g["h_rel"].iloc[0]), float(g["rmse"].iloc[0])
+            h = np.array([h0, h0 * 10.0])
+            y = 3.0 * y0 * (h / h0) ** p
+            ax.plot(h, y, color=INK_MUTED, lw=0.8)
+            ax.text(h[1] * 1.15, y[1], text, fontsize=7, color=INK_MUTED, va="center")
+        ax.set(xscale="log", yscale="log", xlabel="relative bump $h/S_0$", ylabel=f"RMSE of {greek}")
+        ax.set_title(f"({tag}) {greek.capitalize()}, $N = {log2_label(n_paths)}$ paths", loc="left")
+    handles, labels = [], []
+    for ax in axes:  # union of the legend entries of both panels
+        for h_, l_ in zip(*ax.get_legend_handles_labels()):
+            if l_ not in labels:
+                handles.append(h_)
+                labels.append(l_)
+    fig.legend(handles, labels, loc="lower center", ncol=2, bbox_to_anchor=(0.5, -0.01))
+    fig.tight_layout(w_pad=1.5, rect=(0, 0.12, 1, 1))
+    save(fig, "greeks_bump", report)
+
+    for greek in ["delta", "gamma"]:
+        g = df[(df["greek"] == greek) & (df["method"] == "fd_crn")]
+        best = g.loc[g["rmse"].idxmin()]
+        mac.add(f"Best{greek.title()}H", f"{best['h_rel']:.2g}")
+        mac.add(f"Best{greek.title()}Rmse", num(best["rmse"], 2))
+        gi = df[(df["greek"] == greek) & (df["method"] == "fd_independent")]
+        besti = gi.loc[gi["rmse"].idxmin()]
+        mac.add(f"Best{greek.title()}IndepRmse", num(besti["rmse"], 2))
+        mac.add(f"Best{greek.title()}IndepH", f"{besti['h_rel']:.2g}")
+        for method in ["pathwise", "likelihood_ratio"]:
+            r = df[(df["greek"] == greek) & (df["method"] == method)]
+            if len(r):
+                mac.add(f"{greek.title()}{method.title().replace('_', '')}Rmse", num(float(r["rmse"].iloc[0]), 2))
+    mac.add("GreekBumpPaths", log2_label(n_paths))
+    mac.add("GreekReplications", str(int(df["replications"].iloc[0])))
+
+
+def fig_qmc(res: Path, report: Path, mac: Macros) -> None:
+    mc = pd.read_csv(res / "convergence.csv")
+    q = pd.read_csv(res / "qmc.csv")
+    fig, ax = plt.subplots(figsize=(TEXT_WIDTH * 0.62, 2.7))
+    for method in ["crude", "antithetic_control_variate"]:
+        g = mc[mc["method"] == method]
+        st = STYLE[method]
+        s = loglog_slope(g[g["n_paths"] >= 1024]["n_paths"], g[g["n_paths"] >= 1024]["rmse"])
+        name = "crude" if method == "crude" else "antithetic + CV"
+        ax.plot(g["n_paths"], g["rmse"], color=st["color"], marker=st["marker"], label=f"MC, {name}  (${s:.2f}$)")
+    st = STYLE["rqmc_van_der_corput"]
+    fit = q[q["n_paths"] >= 1024]
+    s = loglog_slope(fit["n_paths"], fit["rmse"])
+    mac.add("SlopeRQMC", f"\\ensuremath{{{s:.3f}}}")
+    ax.plot(q["n_paths"], q["rmse"], color=st["color"], marker=st["marker"],
+            label=f"RQMC, shifted van der Corput  (${s:.2f}$)")
+    ax.set_xscale("log", base=2)
+    ax.set(yscale="log", xlabel="number of points $N$", ylabel="RMSE of the price")
+    ax.legend(loc="lower left", fontsize=7, title="estimator (fitted slope)", title_fontsize=7)
+    fig.tight_layout()
+    save(fig, "qmc", report)
+
+    n_max = int(q["n_paths"].max())
+    rq = float(q[q["n_paths"] == n_max]["rmse"].iloc[0])
+    cr = float(mc[(mc["n_paths"] == n_max) & (mc["method"] == "crude")]["rmse"].iloc[0])
+    mac.add("RQMCGainAtMax", num(cr / rq, 2))
+    mac.add("RQMCVarianceGainAtMax", num((cr / rq) ** 2, 2))
+
+
+# --------------------------------------------------------------------------- tables
+def table_variance_reduction(res: Path, gen: Path, mac: Macros) -> None:
+    df = pd.read_csv(res / "variance_reduction.csv")
+    atm = df[(df["type"] == "call") & (df["strike"] == 100.0)]
+    bs = float(atm["bs_price"].iloc[0])
+    lines = [r"\begin{tabular}{lcrrrrr}", r"\toprule",
+             r"Estimator & Price $\pm$ std.\ error & $z$ & $\hat\rho$ & VRF & Time (ms) & Efficiency \\",
+             r"\midrule"]
+    for _, r in atm.iterrows():
+        z = r["error"] / r["std_error"]
+        rho = "--" if not math.isfinite(r["cv_corr"]) else f"{r['cv_corr']:.3f}"
+        lines.append(f"{METHOD_NAMES[r['method']]} & {pm(r['price'], r['std_error'])} & ${z:+.2f}$ & {rho} & "
+                     f"{num(r['vrf'])} & {r['time_s'] * 1e3:.0f} & {num(r['efficiency_gain'])} \\\\")
+    lines += [r"\bottomrule", r"\end{tabular}"]
+    write_table(gen / "table_variance_reduction.tex", "\n".join(lines) + "\n")
+
+    mac.add("BSPrice", f"{bs:.4f}")
+    mac.add("TablePaths", log2_label(int(round(float(atm["variance_per_path"].iloc[0]) /
+                                                float(atm["std_error"].iloc[0]) ** 2))))
+    by = atm.set_index("method")
+    for key, name in [("antithetic", "Anti"), ("control_variate", "CV"), ("antithetic_control_variate", "Both")]:
+        mac.add(f"VRF{name}", num(by.loc[key, "vrf"], 3))
+        mac.add(f"Eff{name}", num(by.loc[key, "efficiency_gain"], 3))
+    mac.add("RhoCV", f"{by.loc['control_variate', 'cv_corr']:.3f}")
+    mac.add("BetaCV", f"{by.loc['control_variate', 'cv_beta']:.3f}")
+    mac.add("TheoryVRFCV", num(1.0 / (1.0 - by.loc['control_variate', 'cv_corr'] ** 2), 3))
+    mac.add("CrudeSE", f"{by.loc['crude', 'std_error']:.4f}")
+    mac.add("BothSE", f"{by.loc['antithetic_control_variate', 'std_error']:.5f}")
+
+    # extremes across strikes, quoted in the discussion
+    for opt in ["call", "put"]:
+        d = df[df["type"] == opt]
+        for key, name in [("antithetic", "Anti"), ("control_variate", "CV"), ("antithetic_control_variate", "Both")]:
+            g = d[d["method"] == key].set_index("strike")
+            mac.add(f"VRF{name}{opt.title()}Low", num(g.loc[70.0, "vrf"], 3))
+            mac.add(f"VRF{name}{opt.title()}High", num(g.loc[130.0, "vrf"], 3))
+
+
+def table_greeks(res: Path, gen: Path, mac: Macros) -> None:
+    df = pd.read_csv(res / "greeks_table.csv")
+    methods = ["fd_crn", "fd_independent", "pathwise", "likelihood_ratio"]
+    lines = [r"\begin{tabular}{lrrrrr}", r"\toprule",
+             r"Greek & Closed form & FD, CRN & FD, independent & Pathwise & Likelihood ratio \\", r"\midrule"]
+    symbols = {"delta": r"$\Delta$", "gamma": r"$\Gamma$", "vega": r"$\mathcal{V}$", "rho": r"$\rho$",
+               "theta": r"$\Theta$"}
+    for greek, symbol in symbols.items():
+        d = df[df["greek"] == greek].set_index("method")
+        exact = float(d["analytic"].iloc[0])
+        top, bottom = [f"{symbol} ({greek})", f"${num(exact, 6)}$"], ["", ""]
+        for m in methods:
+            if m in d.index:
+                v, se = d.loc[m, "value"], d.loc[m, "std_error"]
+                dd = decimals_for(se)
+                top.append(f"${v:.{dd}f}$")
+                bottom.append(f"\\footnotesize ({se:.{dd}f})")
+            else:
+                top.append("n/a")
+                bottom.append("")
+        lines.append(" & ".join(top) + r" \\")
+        lines.append(" & ".join(bottom) + r" \\[2pt]")
+    lines[-1] = lines[-1].replace(r"\\[2pt]", r"\\")
+    lines += [r"\bottomrule", r"\end{tabular}"]
+    write_table(gen / "table_greeks.tex", "\n".join(lines) + "\n")
+
+    d = df[df["greek"] == "delta"].set_index("method")
+    ratio = (d.loc["fd_independent", "std_error"] / d.loc["fd_crn", "std_error"]) ** 2
+    mac.add("DeltaCRNVarianceGain", num(ratio, 2))
+    g = df[df["greek"] == "gamma"].set_index("method")
+    mac.add("GammaCRNVarianceGain", num((g.loc["fd_independent", "std_error"] / g.loc["fd_crn", "std_error"]) ** 2, 2))
+    mac.add("DeltaLRVarianceRatio", num((d.loc["likelihood_ratio", "std_error"] / d.loc["pathwise", "std_error"]) ** 2, 2))
+
+
+def table_asian(res: Path, gen: Path, mac: Macros) -> None:
+    df = pd.read_csv(res / "asian.csv")
+    lines = [r"\begin{tabular}{llcrrr}", r"\toprule",
+             r"Strike & Estimator & Price $\pm$ std.\ error & VRF & Efficiency & $\hat\rho$ \\", r"\midrule"]
+    for k, d in df.groupby("strike", sort=True):
+        first = True
+        for _, r in d.iterrows():
+            rho = "--" if not math.isfinite(r["cv_corr"]) else f"{r['cv_corr']:.4f}"
+            lines.append(f"{'' if not first else f'{k:g}'} & {METHOD_NAMES[r['method']]} & {pm(r['price'], r['std_error'])} & "
+                         f"{num(r['vrf'])} & {num(r['efficiency_gain'])} & {rho} \\\\")
+            first = False
+        ref = d.iloc[0]
+        lines.append(f" & \\textit{{Reference value}} & {pm(ref['reference'], ref['reference_std_error'])} & & & \\\\")
+        if k != df["strike"].max():
+            lines.append(r"\midrule")
+    lines += [r"\bottomrule", r"\end{tabular}"]
+    write_table(gen / "table_asian.tex", "\n".join(lines) + "\n")
+
+    atm = df[df["strike"] == 100.0].set_index("method")
+    mac.add("AsianVRFAnti", num(atm.loc["antithetic", "vrf"], 3))
+    mac.add("AsianVRFCV", num(atm.loc["control_variate", "vrf"], 3))
+    mac.add("AsianVRFBoth", num(atm.loc["antithetic_control_variate", "vrf"], 3))
+    mac.add("AsianEffCV", num(atm.loc["control_variate", "efficiency_gain"], 3))
+    mac.add("AsianRhoCV", f"{atm.loc['control_variate', 'cv_corr']:.4f}")
+    mac.add("AsianRhoBoth", f"{atm.loc['antithetic_control_variate', 'cv_corr']:.4f}")
+    mac.add("AsianBetaCV", f"{atm.loc['control_variate', 'cv_beta']:.3f}")
+    mac.add("AsianGeoPrice", f"{atm['geometric_price'].iloc[0]:.4f}")
+    mac.add("AsianRefPrice", pm(atm["reference"].iloc[0], atm["reference_std_error"].iloc[0]))
+
+
+def table_performance(res: Path, gen: Path, mac: Macros) -> None:
+    df = pd.read_csv(res / "performance.csv")
+    env = dict(pd.read_csv(res / "environment.csv").values)
+    lines = [r"\begin{tabular}{rrrrc}", r"\toprule",
+             r"Threads & Time (ms) & Paths per second & Speed-up & Bitwise identical \\", r"\midrule"]
+    for _, r in df.iterrows():
+        lines.append(f"{int(r['threads'])} & {r['time_s'] * 1e3:.0f} & ${r['paths_per_second'] / 1e6:.1f}\\times 10^6$ & "
+                     f"{r['speedup']:.2f} & {'yes' if int(r['identical_to_serial']) else 'no'} \\\\")
+    lines += [r"\bottomrule", r"\end{tabular}"]
+    write_table(gen / "table_performance.tex", "\n".join(lines) + "\n")
+
+    mac.add("PerfPaths", log2_label(int(df["n_paths"].iloc[0])))
+    mac.add("ThroughputSerial", f"{df['paths_per_second'].iloc[0] / 1e6:.1f}")
+    best = df.loc[df["paths_per_second"].idxmax()]
+    mac.add("ThroughputParallel", f"{best['paths_per_second'] / 1e6:.0f}")
+    mac.add("SpeedupMax", f"{best['speedup']:.1f}")
+    mac.add("ThreadsBest", str(int(best["threads"])))
+    mac.add("ThreadsMax", str(int(df["threads"].max())))
+    mac.add("AllIdentical", "yes" if df["identical_to_serial"].all() else "no")
+    mac.add("CompilerName", tex_escape(str(env.get("compiler", "unknown"))))
+    mac.add("CPUName", tex_escape(cpu_name()).replace("(R)", "").replace("(TM)", "").replace("  ", " "))
+
+
+# --------------------------------------------------------------------------- main
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--results", type=Path, default=ROOT / "results")
+    parser.add_argument("--report", type=Path, default=ROOT / "report")
+    args = parser.parse_args()
+
+    (args.report / "figures").mkdir(parents=True, exist_ok=True)
+    gen = args.report / "generated"
+    gen.mkdir(parents=True, exist_ok=True)
+    setup_style()
+
+    mac = Macros()
+    table_variance_reduction(args.results, gen, mac)
+    bs = float(pd.read_csv(args.results / "variance_reduction.csv").query("type == 'call' and strike == 100.0")["bs_price"].iloc[0])
+    table_greeks(args.results, gen, mac)
+    table_asian(args.results, gen, mac)
+    table_performance(args.results, gen, mac)
+    fig_convergence(args.results, args.report, mac)
+    fig_running(args.results, args.report, bs)
+    fig_variance_reduction(args.results, args.report)
+    fig_greeks_bump(args.results, args.report, mac)
+    fig_qmc(args.results, args.report, mac)
+    mac.write(gen / "results.tex")
+    print(f"figures written to {args.report / 'figures'}, tables and macros to {gen}")
+
+
+if __name__ == "__main__":
+    main()
