@@ -1,0 +1,26 @@
+# build trees
+build/
+build-*/
+cmake-build-*/
+out/
+
+# IDEs
+.vs/
+.vscode/
+.idea/
+*.user
+
+# Python
+__pycache__/
+*.pyc
+
+# LaTeX intermediates (the compiled report.pdf is versioned)
+report/*.aux
+report/*.bbl
+report/*.blg
+report/*.fdb_latexmk
+report/*.fls
+report/*.log
+report/*.out
+report/*.toc
+report/*.synctex.gz
